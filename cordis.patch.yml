@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-daily-viewer
+      name: '@local/dsh-daily-viewer'
+      config:
+        site_dir: 'D:\Program Files (x86)\dsh-deploy\archive\daily\ai-tech-daily\site'
+        port: 8731
