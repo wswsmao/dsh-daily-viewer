@@ -61,14 +61,96 @@ export function apply(ctx, config = {}) {
   const siteDir = String(config.site_dir || 'D:\\Program Files (x86)\\dsh-deploy\\archive\\daily\\ai-tech-daily\\site');
   const requestedPort = Number.isSafeInteger(config.port) ? config.port : 8731;
   const host = '127.0.0.1'; // loopback only: never reachable from another machine
+  // Feedback is appended here as JSONL. Only this reader writes it, so a thumbs-down never travels
+  // through the published site directory, which a git push could carry off the machine.
+  const feedbackFile = String(
+    config.feedback_file || 'D:\\Program Files (x86)\\dsh-deploy\\archive\\daily\\ai-tech-daily\\.runtime\\feedback.jsonl',
+  );
 
   let server = null;
   let actualPort = requestedPort;
+
+  const json = (res, code, value) => {
+    res.writeHead(code, { ...headers('application/json; charset=utf-8'), 'cache-control': 'no-store' });
+    res.end(JSON.stringify(value));
+  };
+
+  /** Record one verdict. A down-vote must say why: the reason is what a later review analyses, and a
+   *  bare thumbs-down carries no information beyond "I was unhappy". */
+  const readBody = (req) =>
+    new Promise((resolve, reject) => {
+      let size = 0;
+      const chunks = [];
+      req.on('data', (c) => {
+        size += c.length;
+        if (size > 8000) {
+          reject(new Error('BODY_TOO_LARGE'));
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+        } catch {
+          reject(new Error('BODY_NOT_JSON'));
+        }
+      });
+      req.on('error', reject);
+    });
+
+  const handleFeedback = async (req, res) => {
+    if (req.method !== 'POST') {
+      json(res, 405, { ok: false, error: 'METHOD_NOT_ALLOWED' });
+      return;
+    }
+    let body;
+    try {
+      body = await readBody(req);
+    } catch (error) {
+      json(res, 400, { ok: false, error: String(error.message) });
+      return;
+    }
+    const verdict = String(body?.verdict ?? '');
+    if (verdict !== 'bad' && verdict !== 'good') {
+      json(res, 400, { ok: false, error: 'VERDICT_INVALID' });
+      return;
+    }
+    const reason = String(body?.reason ?? '').trim();
+    // Requiring a reason is the point of this channel: it is what turns "I did not like it" into
+    // something a review can group and act on.
+    if (verdict === 'bad' && !reason) {
+      json(res, 400, { ok: false, error: 'REASON_REQUIRED' });
+      return;
+    }
+    const entry = {
+      at: new Date().toISOString(),
+      verdict,
+      reason: reason.slice(0, 500),
+      articleId: String(body?.articleId ?? '').slice(0, 120),
+      title: String(body?.title ?? '').slice(0, 300),
+      author: String(body?.author ?? '').slice(0, 120),
+      account: String(body?.account ?? '').slice(0, 120),
+      category: String(body?.category ?? '').slice(0, 60),
+      score: Number.isFinite(body?.score) ? body.score : null,
+      date: String(body?.date ?? '').slice(0, 10),
+      version: Number.isFinite(body?.version) ? body.version : null,
+    };
+    if (!entry.articleId && !entry.title) {
+      json(res, 400, { ok: false, error: 'ARTICLE_REQUIRED' });
+      return;
+    }
+    await fs.mkdir(path.dirname(feedbackFile), { recursive: true });
+    await fs.appendFile(feedbackFile, `${JSON.stringify(entry)}\n`, 'utf8');
+    json(res, 200, { ok: true, recorded: entry });
+  };
 
   const handler = async (req, res) => {
     try {
       const clean = safePath(req.url);
       if (clean === null) { res.writeHead(400, headers('text/plain; charset=utf-8')); res.end('bad request'); return; }
+      if (clean === '/api/feedback') { await handleFeedback(req, res); return; }
       const file = await resolveFile(siteDir, clean);
       if (!file) { res.writeHead(404, headers('text/plain; charset=utf-8')); res.end('not found'); return; }
       const type = MIME[path.extname(file).toLowerCase()] || 'application/octet-stream';
